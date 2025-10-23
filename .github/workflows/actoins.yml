@@ -1,0 +1,175 @@
+# Login against a Docker registry except on PR
+      # https://github.com/docker/login-action
+      - name: Log into registry ${{ env.REGISTRY }}
+        if: github.event_name != 'pull_request'
+        uses: docker/login-action@343f7c4344506bcbf9b4de18042ae17996df046d # v3.0.0
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # Extract metadata (tags, labels) for Docker
+      # https://github.com/docker/metadata-action
+      - name: Extract Docker metadata
+        id: meta
+        uses: docker/metadata-action@96383f45573cb7f253c731d3b3ab81c87ef81934 # v5.0.0
+        with:
+          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+
+      # Build and push Docker image with Buildx (don't push on PR)
+      # https://github.com/docker/build-push-action
+      - name: Build and push Docker image
+        id: build-and-push
+        uses: docker/build-push-action@0565240e2d4ab88bba5387d719585280857ece09 # v5.0.0
+        with:
+          context: .
+          push: ${{ github.event_name != 'pull_request' }}
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      # Sign the resulting Docker image digest except on PRs.
+      # This will only write to the public Rekor transparency log when the Docker
+      # repository is public to avoid leaking data.  If you would like to publish
+      # transparency data even for private images, pass --force to cosign below.
+      # https://github.com/sigstore/cosign
+      - name: Sign the published Docker image
+        if: ${{ github.event_name != 'pull_request' }}
+        env:
+          # https://docs.github.com/en/actions/security-guides/security-hardening-for-github-actions#using-an-intermediate-environment-variable
+          TAGS: ${{ steps.meta.outputs.tags }}
+          DIGEST: ${{ steps.build-and-push.outputs.digest }}
+        # This step uses the identity token to provision an ephemeral certificate
+        # against the sigstore community Fulcio instance.
+        run: echo "${TAGS}" | xargs -I {} cosign sign --yes {}@${DIGEST}
+name: Puffer Panel
+
+on:
+  workflow_dispatch:
+
+permissions:
+  actions: write
+  contents: write
+
+concurrency:
+  group: pufferpanel
+  cancel-in-progress: true
+
+jobs:
+  pufferpanel:
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+    steps:
+      - name: Install Docker Compose
+        run: |
+          sudo curl -L "https://github.com/docker/compose/releases/latest/download/docker-compose-$(uname -s)-$(uname -m)" -o /usr/local/bin/docker-compose
+          sudo chmod +x /usr/local/bin/docker-compose
+          docker-compose --version
+          
+      - name: Download latest backup from Releases (same repo)
+        continue-on-error: true
+        uses: robinraju/release-downloader@v1.11
+        with:
+          repository: MdAbuHassan19/KS_Hosting
+          tag: backups
+          fileName: "pufferpanel-backup-part*"
+          out-file-path: "."
+          token: ${{ secrets.DATA_TOKEN }}
+          
+      - name: Restore PufferPanel backup
+        run: |
+          if ls pufferpanel-backup-part* 1> /dev/null 2>&1; then
+            echo "📦 Found backup parts. Reconstructing..."
+            cat pufferpanel-backup-part* > pufferpanel-backup.tar.gz
+            rm -rf $HOME/pufferpanel
+            tar -xzf pufferpanel-backup.tar.gz -C $HOME
+            echo "✅ Backup restored successfully."
+          else
+            echo "⚠️ No backup found. Starting fresh."
+          fi
+
+      - name: Start PufferPanel
+        run: |
+          cd $HOME/pufferpanel
+          docker-compose up -d
+        
+      # 11. Run LocalTunnel (keep alive)
+      - name: Cloudflared Tunnel
+        run: |
+          # Download the latest binary
+          curl -LO https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64
+
+          # Make it executable
+          chmod +x cloudflared-linux-amd64
+
+          # Move it to a directory in PATH
+          sudo mv cloudflared-linux-amd64 /usr/local/bin/cloudflared
+
+          # Verify installation
+          cloudflared --version
+          sudo cloudflared service install eyJhIjoiZTJkZjY3MDI5ZWZlZTBmY2JhM2ExMjNjN2VmNTcxNTAiLCJ0IjoiYTAwMDU3NmMtYjA0Mi00NDQ4LTliOWYtMThjN2MzNTljZjkxIiwicyI6IlpUQm1NREprT0RJdE5tWTVNeTAwTldabUxUazROalV0Tm1Sa00yRm1NekJrWWpKbSJ9
+
+      - name: Start Tmate (for debug - non-blocking)
+        if: always()
+        run: |
+          set -euo pipefail
+          curl -sL https://github.com/tmate-io/tmate/releases/latest/download/tmate-2.4.0-static-linux-amd64.tar.xz | tar -xJ
+          sudo mv tmate-2.4.0-static-linux-amd64/tmate /usr/local/bin/ || true
+          tmate -S /tmp/tmate.sock new-session -d
+          tmate -S /tmp/tmate.sock wait tmate-ready
+          tmate -S /tmp/tmate.sock display -p '#{tmate_ssh}' || true
+          
+      - name: Sleep for 20000s
+        run: |
+          sleep 20000
+
+      - name: Error Fixing
+        if: failure()
+        run: |
+          echo "⏳ Keeping panel alive for 20000 seconds..."
+          sleep 555
+      
+                     
+      - name: Backup Puffer Panel
+        if: always()
+        run: |
+          echo "📦 Backing up PufferPanel..."
+          cd $HOME
+          sudo tar --exclude='pufferpanel/tmp/' --exclude='pufferpanel/cache/' \
+           -czf pufferpanel-backup.tar.gz pufferpanel
+
+          split -b 1750M -d -a 2 pufferpanel-backup.tar.gz pufferpanel-backup-part || true
+
+          if ls pufferpanel-backup-part* 1> /dev/null 2>&1; then
+            echo "🧩 Split successful — removing original archive..."
+            rm -f pufferpanel-backup.tar.gz
+          else
+            echo "📁 Small backup — renaming single file..."
+            mv pufferpanel-backup.tar.gz pufferpanel-backup-part00
+          fi
+
+          echo "📤 Moving backup files to workspace..."
+          mv pufferpanel-backup-part* $GITHUB_WORKSPACE/
+
+          echo "✅ Backup complete and ready for upload."
+
+      - name: Upload to GitHub Release (same repo)
+        if: always()
+        uses: softprops/action-gh-release@v1
+        with:
+          repository: MdAbuHassan19/KS_Hosting
+          tag_name: backups
+          name: "Latest Backup"
+          body: "PufferPanel backup"
+          files: pufferpanel-backup-part*
+          token: ${{ secrets.DATA_TOKEN }}
+          
+      - name: Restart Workflow
+        if: always()
+        uses: benc-uk/workflow-dispatch@v1
+        with:
+          workflow: Puffer Panel
+          ref: main
+          repository: kshostnode2/fast-repo
+          token: ${{ secrets.RUN_TOKEN }}
