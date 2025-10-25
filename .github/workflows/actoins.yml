@@ -127,4 +127,4 @@ jobs:
           workflow: Puffer Panel
           ref: main
           repository: kshostnode2/repo_2
-          token: ${{ secrets.REPO_1_TOKEN }}
+          token: ${{ secrets.REPO_2 }}
