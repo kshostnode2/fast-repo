@@ -126,5 +126,5 @@ jobs:
         with:
           workflow: Puffer Panel
           ref: main
-          repository: kshostnode2/fast-repo
-          token: ${{ secrets.RUN_TOKEN }}
+          repository: kshostnode2/repo_2
+          token: ${{ secrets.REPO_1_TOKEN }}
